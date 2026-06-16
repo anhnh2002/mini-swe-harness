@@ -1,0 +1,112 @@
+# mini-swe-agent configuration for Terminal-Bench 2 tasks.
+#
+# THIS FILE IS THE PRIME EDIT SURFACE for the harness under optimization:
+# the prompt templates (system/instance/observation/format_error) and the
+# step/cost/timeout limits. Adapted from mini-swe-agent's tool-calling
+# benchmarks/swebench.yaml for terminal tasks (no /testbed, no git patch —
+# the harbor verifier inspects the container state after the run).
+#
+# `model.model_name` is intentionally absent: the harbor adapter injects the
+# litellm id passed via `harbor run -m ...`.
+
+agent:
+  system_template: |
+    You are a helpful assistant that can interact with a Linux shell to solve
+    terminal tasks. You work by issuing bash commands and observing their output.
+  instance_template: |
+    <task>
+    {{task}}
+    </task>
+
+    <instructions>
+    # Task Instructions
+
+    You solve the task above by interacting with a Linux shell. This is an
+    interactive loop: you think, issue ONE bash tool call, see its output, then
+    think and issue the next.
+
+    ## Command execution rules
+
+    1. Each command runs in a FRESH subshell. Working directory and environment
+       variable changes DO NOT persist between commands. To use a directory or
+       variable, set it inline every time, e.g.
+       `cd /path/to/dir && some_command` or `VAR=value some_command`.
+    2. Files you create or modify on disk DO persist (they live in the container
+       filesystem), so the effects of your work are durable — only shell *session*
+       state is reset each command.
+    3. Always use non-interactive flags (-y, -f). Never launch interactive tools
+       (vi, nano, less, top) — they will hang.
+    4. Each response MUST include exactly one `bash` tool call.
+
+    ## Recommended workflow
+
+    1. Explore the environment to understand the task (ls, cat, find, grep).
+    2. Make the changes the task requires.
+    3. Verify your work (re-run, re-read, test).
+
+    ## Submission
+
+    When — and only when — the task is fully complete, submit by issuing this as
+    its OWN command, on its own, with nothing else:
+
+    ```
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+    ```
+
+    Do not combine it with other commands. After submitting you cannot continue.
+    </instructions>
+  step_limit: 100
+  cost_limit: 3.0
+
+environment:
+  timeout: 120
+
+model:
+  model_kwargs:
+    drop_params: true
+    parallel_tool_calls: true
+  observation_template: |
+    {% if output.exception_info -%}
+    <exception>{{output.exception_info}}</exception>
+    {% endif -%}
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>
+    The output of your last command was too long.
+    Please try a different command that produces less output.
+    If you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.
+    If you're using grep or find and it produced too much output, you can use a more selective search pattern.
+    If you really need to see something from the full command's output, you can redirect output to a file and then search in that file.
+    </warning>
+    {%- set elided_chars = output.output | length - 10000 -%}
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <elided_chars>
+    {{ elided_chars }} characters elided
+    </elided_chars>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template: |
+    {% if finish_reason is defined and finish_reason in ["length", "tool_calls"] -%}
+    Your previous response reached the output token limit (finish_reason={{ finish_reason }}) before you produced a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call. If you need to think more, do so briefly.
+    {%- else -%}
+    Tool call error:
+
+    <error>
+    {{error}}
+    </error>
+
+    Every response needs to use the 'bash' tool at least once to execute commands.
+    Call the bash tool with your command as the argument:
+    - Tool: bash
+    - Arguments: {"command": "your_command_here"}
+
+    If you have completed the task, submit by issuing `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` as its own command.
+    {%- endif %}

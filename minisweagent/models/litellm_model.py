@@ -24,6 +24,28 @@ from minisweagent.models.utils.retry import retry
 logger = logging.getLogger("litellm_model")
 
 
+def _strip_response_artifacts(obj: Any) -> Any:
+    """Remove response-only fields before replaying a message as a request.
+
+    ``model_dump()`` on a litellm response message carries fields that are only
+    valid on the *response* side -- notably litellm's ``provider_specific_fields``
+    and null-valued optionals like ``function_call``. Strict OpenAI-compatible
+    endpoints (e.g. Fireworks) validate request messages with ``extra="forbid"``
+    and reject any such key, so we drop ``provider_specific_fields`` and all
+    ``None`` values, recursing into ``tool_calls``. Non-null fields (content,
+    tool_calls, reasoning_content, ...) are preserved untouched.
+    """
+    if isinstance(obj, dict):
+        return {
+            k: _strip_response_artifacts(v)
+            for k, v in obj.items()
+            if k != "provider_specific_fields" and v is not None
+        }
+    if isinstance(obj, list):
+        return [_strip_response_artifacts(v) for v in obj]
+    return obj
+
+
 class LitellmModelConfig(BaseModel):
     model_name: str
     """Model name. Highly recommended to include the provider in the model name, e.g., `anthropic/claude-sonnet-4-5-20250929`."""
@@ -74,7 +96,7 @@ class LitellmModel:
             raise e
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
-        prepared = [{k: v for k, v in msg.items() if k != "extra"} for msg in messages]
+        prepared = [_strip_response_artifacts({k: v for k, v in msg.items() if k != "extra"}) for msg in messages]
         prepared = _reorder_anthropic_thinking_blocks(prepared)
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 

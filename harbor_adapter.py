@@ -15,6 +15,7 @@ command back onto harbor's event loop (:class:`HarborBridgeEnv`).
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,22 @@ from minisweagent.models.litellm_model import LitellmModel
 
 _CONFIG_PATH = Path(__file__).with_name("terminal_bench.yaml")
 _SUBMIT_SENTINEL = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+# Consecutive command-marshaling failures (the ``except Exception`` path in
+# ``HarborBridgeEnv.execute``) after which the environment is presumed dead.
+_MAX_CONSECUTIVE_EXEC_FAILURES = 3
+
+
+class TrialAborted(Exception):
+    """The trial's container is gone (harbor cancelled the trial, or every
+    recent exec failed to reach it); the agent loop must stop.
+
+    Deliberately NOT a minisweagent flow-control exception: ``DefaultAgent.run``
+    records it as a final ``exit_status: "TrialAborted"`` message, saves the
+    trajectory once, and re-raises — which ends the worker thread. Without
+    this, a thread orphaned by harbor's ``wait_for`` cancellation keeps
+    talking to a deleted container until its own limits trip (tb2-006: up to
+    24 minutes and ~18% of evaluator spend per run).
+    """
 
 
 def _load_config() -> dict[str, Any]:
@@ -50,9 +67,22 @@ class HarborBridgeEnv:
         self._loop = loop
         self._user = user if user is not None else getattr(henv, "default_user", "root")
         self._timeout = timeout
+        self._abort = threading.Event()
+        self._consecutive_exec_failures = 0
         self.config = {"timeout": timeout, "user": self._user}
 
+    def abort(self) -> None:
+        """Make the next ``execute`` raise :class:`TrialAborted`. Called from
+        the event-loop thread when harbor cancels the trial; thread-safe."""
+        self._abort.set()
+
     def execute(self, action: dict, cwd: str = "") -> dict[str, Any]:
+        # Checked BEFORE the marshaling try/except so the catch-all below can
+        # never convert an abort into one more dead observation.
+        if self._abort.is_set():
+            raise TrialAborted(
+                "harbor cancelled the trial; the container is gone"
+            )
         command = action.get("command", "")
         try:
             res = asyncio.run_coroutine_threadsafe(
@@ -65,7 +95,19 @@ class HarborBridgeEnv:
                 "returncode": res.return_code,
                 "exception_info": "",
             }
+            self._consecutive_exec_failures = 0
         except Exception as e:  # surface as an observation, never crash the loop
+            # ... unless nothing has reached the container for a while: N
+            # consecutive marshaling failures mean the environment is dead
+            # (torn down, or the loop is gone) and feeding the model more
+            # rc=-1 observations only burns tokens against a lost trial.
+            self._consecutive_exec_failures += 1
+            if self._consecutive_exec_failures >= _MAX_CONSECUTIVE_EXEC_FAILURES:
+                raise TrialAborted(
+                    f"{self._consecutive_exec_failures} consecutive command "
+                    f"executions failed to reach the container (last: {e}); "
+                    "presuming the environment is dead"
+                ) from e
             output = {
                 "output": str(e),
                 "returncode": -1,
@@ -141,6 +183,14 @@ class MiniSweHarborAgent(BaseAgent):
         )
         try:
             await asyncio.to_thread(agent.run, instruction)
+        except BaseException:
+            # BaseException so CancelledError lands here: harbor's wait_for
+            # cancels this await but CANNOT kill the worker thread. Flag the
+            # bridge so the orphan's next execute() raises TrialAborted and
+            # the thread unwinds, instead of running against a deleted
+            # container until its own limits trip.
+            bridge.abort()
+            raise
         finally:
             self._record_usage(context, agent)
 
